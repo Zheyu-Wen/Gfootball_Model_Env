@@ -42,35 +42,45 @@ if __name__ == '__main__':
     args = init_args()
     # create environments
     envs = create_single_football_env(args)
-    train = False
+    train = True
     if train == True:
         # create networks
         policy_net = cnn_net(envs.action_space.n)
         env_net = env_net(envs.observation_space.shape)
         # create the ppo agent
         ppo_trainer = ppo_agent(envs, args, policy_net, env_net)
-        num_collected_data = np.int(1e5)
-        num_epoch = 1000
+        num_collected_data = np.int(1e4)
+        num_epoch = 100
         poloss_hist = []
         envloss_hist = []
         reward_history = []
         for iters in range(num_epoch):
+            if iters % 5 == 0:
+                ppo_trainer.target_net.load_state_dict(ppo_trainer.main_net.state_dict())
             envs.reset()
             obs_hist, actions_hist, returns, adv_hist, reward_hist = ppo_trainer.collect_train_data(num_collected_data)
-            if np.mean(reward_hist) > 0:
-                policy_loss, env_loss = ppo_trainer._update_network_by_env_net(obs_hist, actions_hist, reward_hist)
-                print('In epoch {}\n policy loss is: {}\n env loss is: {}'.format(iters, policy_loss, env_loss))
-                poloss_hist.append(policy_loss)
-                envloss_hist.append(env_loss)
-            else:
-                env_loss = ppo_trainer._update_network_by_env_net(obs_hist, actions_hist, reward_hist)
-                print('In epoch {}\n env loss is: {}'.format(iters, env_loss))
-                envloss_hist.append(env_loss)
-            if iters % 5 == 0:
+            policy_loss, env_loss = ppo_trainer._update_network_by_env_net(obs_hist, actions_hist, reward_hist)
+            print('In epoch {}\n policy loss is: {}\n env loss is: {}\n the reward is: {}\n'.format(iters, policy_loss, env_loss, np.mean(reward_hist)))
+            poloss_hist.append(policy_loss)
+            envloss_hist.append(env_loss)
+            # else:
+            #     env_loss = ppo_trainer._update_network_by_env_net(obs_hist, actions_hist, reward_hist)
+            #     print('In epoch {}\n env loss is: {}'.format(iters, env_loss))
+            #     envloss_hist.append(env_loss)
+            if iters % 10 == 0:
                 _ = ppo_trainer._update_network_wo_env_net(obs_hist, actions_hist, returns, adv_hist)
+                print('reward:{}'.format(np.mean(reward_hist)))
 
             evaluation_process = evaluation(args.policy_model_dir, envs.action_space.n, envs, args)
             reward_history.append(evaluation_process.eval())
+        try:
+            policy_loss = np.array(policy_loss)
+            env_loss = np.array(env_loss)
+            np.save('policy_loss.npy', policy_loss)
+            np.save('env_loss.npy', env_loss)
+        except:
+            env_loss = np.array(env_loss)
+            np.save('env_loss.npy', env_loss)
         plt.plot(np.arange(len(reward_history)), reward_history, label="reward")
         plt.xlabel("iter")
         plt.ylabel("reward")

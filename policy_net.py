@@ -54,5 +54,5 @@ class cnn_net(nn.Module):
     def forward(self, inputs):
         x = self.cnn_layer(inputs / 255.0)
         value = self.critic(x)
-        pi = torch.sigmoid(self.actor(x))
+        pi = F.softmax(self.actor(x), dim=1)
         return value, pi

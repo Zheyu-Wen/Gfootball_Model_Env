@@ -15,8 +15,8 @@ class ppo_agent:
         self.main_net = policy_net
         self.target_net = copy.deepcopy(policy_net)
         self.env_net = env_net
-        self.policy_optimizer = optim.Adam(self.main_net.parameters(), lr=args.lr)
-        self.env_optimizer = optim.Adam(self.env_net.parameters(), lr=args.lr)
+        self.policy_optimizer = optim.Adam(self.main_net.parameters(), lr=1e-5)
+        self.env_optimizer = optim.Adam(self.env_net.parameters(), lr=1e-5)
         self.obs_init = envs.reset()
         self.obs_shape = envs.observation_space.shape
         if not os.path.exists(args.policy_model_dir):
@@ -34,17 +34,27 @@ class ppo_agent:
         dones = 0
         num_hist = 0
         for iters in range(num_hist_max):
-            if dones != 1:
-                num_hist += 1
-                with torch.no_grad():
-                    obs = self._get_tensors(obs)
-                    values, pis = self.main_net(obs)
-                    obs_hist[iters, :, :, :] = obs
-                actions = self.select_actions(pis)
-                actions_hist.append(actions)
-                value_hist.append(values.detach().cpu().numpy().squeeze())
-                obs, rewards, dones, _ = self.envs.step(actions)
-                reward_hist.append(rewards)
+            if dones==1:
+                self.envs.reset()
+            num_hist += 1
+            with torch.no_grad():
+                obs = self._get_tensors(obs)
+                values, pis = self.main_net(obs)
+                obs_hist[iters, :, :, :] = obs
+            # exploration and exploitation tradeoff
+            # if np.random.choice(np.arange(10))/10 < 0.3:
+            #     actions = np.zeros([obs.shape[0], 1])
+            #     for i in range(obs.shape[0]):
+            #         actions[i, :] = np.int(np.random.choice(self.envs.action_space.n))
+            try:
+                actions = np.int(self.select_actions(pis))
+            except:
+                pis = torch.tensor(np.ones_like(pis.detach().cpu().numpy())/2)
+                actions = np.int(self.select_actions(pis))
+            actions_hist.append(actions)
+            value_hist.append(values.detach().cpu().numpy().squeeze())
+            obs, rewards, dones, _ = self.envs.step(actions)
+            reward_hist.append(rewards)
 
         reward_hist = np.array(reward_hist, dtype=np.float32)
         actions_hist = np.array(actions_hist, dtype=np.float32)
@@ -73,19 +83,19 @@ class ppo_agent:
         returns = returns.reshape(num_hist, 1)
         adv_hist = adv_hist.reshape(num_hist, 1)
         # before update the network, the old network will try to load the weights
-        self.target_net.load_state_dict(self.main_net.state_dict())
-        print('collect memory data successfully')
         return obs_hist, actions_hist, returns, adv_hist, reward_hist
 
 
     # update the network
     def _update_network_by_env_net(self, obs, actions, reward):
-        print('updating env net and policy net')
         inds = np.arange(obs.shape[0])
         nbatch_train = obs.shape[0] // self.args.batch_size
         BCE_loss = torch.nn.BCELoss()
         L1_loss = torch.nn.L1Loss()
-        env_train_time = 1
+        if np.mean(reward)>0:
+            env_train_time = 10
+        else:
+            env_train_time = 1
         policy_train_time = 1
         for _ in range(self.args.epoch):
             np.random.shuffle(inds)
@@ -99,37 +109,47 @@ class ppo_agent:
                 obs_temp = torch.tensor(obs_temp, dtype=torch.float32)
                 actions_temp = torch.tensor(actions_temp, dtype=torch.float32)
                 reward_temp = torch.tensor(reward_temp, dtype=torch.float32)
-                for _ in range(env_train_time):
-                    self.env_optimizer.zero_grad()
-                    pred_reward = self.env_net(obs_temp, actions_temp)
-                    env_loss = BCE_loss(pred_reward, reward_temp.reshape(-1, 1))
-                    env_loss.backward()
-                    self.env_optimizer.step()
-                if np.mean(reward) > 0:
-                    obs_shape = (-1, ) + self.obs_shape
-                    obs_temp2 = np.reshape(obs_temp.detach().cpu().numpy(), obs_shape)
-                    obs_temp2 = np.transpose(obs_temp2, (0, 3, 1, 2))
-                    obs_temp2 = torch.tensor(obs_temp2, dtype=torch.float32)
 
-                    _, pis = self.main_net(obs_temp2)
+                self.env_optimizer.zero_grad()
+                pred_reward = self.env_net(obs_temp, actions_temp)
+                env_loss = BCE_loss(pred_reward, reward_temp.reshape(-1, 1))
+                torch.nn.utils.clip_grad_norm_(self.env_net.parameters(), self.args.max_grad_norm)
+                env_loss.backward()
+                self.env_optimizer.step()
+                # if np.mean(reward) > 0:
+
+                obs_shape = (-1, ) + self.obs_shape
+                obs_temp2 = np.reshape(obs_temp.detach().cpu().numpy(), obs_shape)
+                obs_temp2 = np.transpose(obs_temp2, (0, 3, 1, 2))
+                obs_temp2 = torch.tensor(obs_temp2, dtype=torch.float32)
+
+                _, pis = self.main_net(obs_temp2)
+                # if np.random.choice(np.arange(10)) / 10 < 0.3:
+                #     pred_action = np.zeros([obs_temp.shape[0], 1])
+                #     for i in range(obs_temp.shape[0]):
+                #         pred_action[i, :] = np.int(np.random.choice(self.envs.action_space.n))
+                # else:
+                try:
                     pred_action = self.select_actions(pis)
-                    pred_action = np.reshape(pred_action, [-1, 1])
-                    pred_action = torch.tensor(pred_action, dtype=torch.float32)
-                    with torch.no_grad():
-                        corresponding_reward = self.env_net(obs_temp, pred_action)
-                    policy_loss = BCE_loss(corresponding_reward, torch.ones_like(corresponding_reward))
-                    self.policy_optimizer.zero_grad()
-                    policy_loss.backward()
-                    self.policy_optimizer.step()
-                    torch.save(self.main_net.state_dict(), self.args.policy_model_dir + '/policy_net.pth')
-        if np.mean(reward) > 0:
-            return env_loss.item(), policy_loss.item()
-        else:
-            return env_loss.item()
+                except:
+                    pis = torch.tensor(np.ones_like(pis.detach().cpu().numpy())/2)
+                    pred_action = self.select_actions(pis)
+                pred_action = np.reshape(pred_action, [-1, 1])
+                pred_action = torch.tensor(pred_action, dtype=torch.float32)
+                corresponding_reward = self.env_net(obs_temp, pred_action)
+                policy_loss = BCE_loss(corresponding_reward, torch.ones_like(corresponding_reward))
+                torch.nn.utils.clip_grad_norm_(self.main_net.parameters(), self.args.max_grad_norm)
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                self.policy_optimizer.step()
+                torch.save(self.main_net.state_dict(), self.args.policy_model_dir + '/policy_net.pth')
+        # if np.mean(reward) > 0:
+        return env_loss.item(), policy_loss.item()
+        # else:
+        #     return env_loss.item()
 
 
     def _update_network_wo_env_net(self, obs, actions, returns, advantages):
-        print('update policy net by only ppo')
         inds = np.arange(obs.shape[0])
         nbatch_train = obs.shape[0] // self.args.batch_size
         for _ in range(self.args.epoch):
