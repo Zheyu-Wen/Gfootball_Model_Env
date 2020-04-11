@@ -6,9 +6,9 @@ from datetime import datetime
 import os
 import copy
 
-class ppo_agent:
-    def __init__(self, envs, args, net, env_net=None):
-        self.envs = envs 
+class ppo_agent_gan:
+    def __init__(self, envs, args, net, env_net):
+        self.envs = envs
         self.args = args
         # define the newtork...
         self.net = net
@@ -50,8 +50,10 @@ class ppo_agent:
         reward_hist = []
         policy_loss_hist = []
         env_loss_hist = []
+        threshold = 0.5
         for update in range(num_updates):
             mb_obs, mb_rewards, mb_actions, mb_dones, mb_values = [], [], [], [], []
+            good_actions, bad_actions, good_reward, bad_reward, gobs, bobs, gpis, bpis = [], [], [], [], [], [], [], []
             if self.args.lr_decay:
                 self._adjust_learning_rate(update, num_updates)
             for step in range(self.args.nsteps):
@@ -62,7 +64,7 @@ class ppo_agent:
                 # select actions
                 actions = select_actions(pis)
                 # get the input actions
-                input_actions = actions 
+                input_actions = actions
                 # start to store information
                 mb_obs.append(np.copy(self.obs))
                 mb_actions.append(actions)
@@ -70,6 +72,16 @@ class ppo_agent:
                 mb_values.append(values.detach().cpu().numpy().squeeze())
                 # start to excute the actions in the environment
                 obs, rewards, dones, _ = self.envs.step(input_actions)
+                if rewards.mean() > threshold:
+                    gpis.append(pis)
+                    good_actions.append(actions)
+                    good_reward.append(rewards)
+                    gobs.append(self.obs)
+                else:
+                    bpis.append(pis)
+                    bad_actions.append(actions)
+                    bad_reward.append(rewards)
+                    bobs.append(self.obs)
                 # update dones
                 self.dones = dones
                 mb_rewards.append(rewards)
@@ -118,16 +130,23 @@ class ppo_agent:
             # before update the network, the old network will try to load the weights
             self.old_net.load_state_dict(self.net.state_dict())
             # start to update the network
-            pl, vl, ent = self._update_network(mb_obs, mb_actions, mb_returns, mb_advs)
-            # env_loss, policy_loss = self._update_network_by_env_net(mb_obs, mb_actions, mb_rewards)
+            if update <= 30:
+                pl, vl, ent = self._update_network(mb_obs, mb_actions, mb_returns, mb_advs)
+            good_reward = np.asarray(good_reward, dtype=np.float32)
+            good_actions = np.asarray(good_actions, dtype=np.float32)
+            bad_reward = np.asarray(bad_reward, dtype=np.float32)
+            bad_actions = np.asarray(bad_actions, dtype=np.float32)
+            gobs = np.asarray(gobs, dtype=np.float32)
+            bobs = np.asarray(bobs, dtype=np.float32)
+            env_loss, policy_loss = self._update_network_by_env_net(good_actions, good_reward, bad_actions, bad_reward, gobs, bobs, gpis, bpis)
             # display the training information
             reward_hist.append(final_rewards.mean().detach().cpu().numpy())
-            policy_loss_hist.append(pl)
-            # env_loss_hist.append(env_loss)
+            policy_loss_hist.append(policy_loss)
+            env_loss_hist.append(env_loss)
             if update % self.args.display_interval == 0:
-                self.logger.info('[{}] Update: {} / {}, Frames: {}, Rewards: {:.3f}, Min: {:.3f}, Max: {:.3f}'
-                                 .format(datetime.now(), update, num_updates, (update + 1)*self.args.nsteps*self.args.num_workers, \
-                                final_rewards.mean().item(), final_rewards.min().item(), final_rewards.max().item()))
+                self.logger.info('[{}] Update: {} / {}, Frames: {}, Rewards: {:.3f}, Min: {:.3f}, Max: {:.3f}, env_loss: {:.3f},'\
+                    'net_loss: {:.3f}'.format(datetime.now(), update, num_updates, (update + 1)*self.args.nsteps*self.args.num_workers, \
+                    final_rewards.mean().item(), final_rewards.min().item(), final_rewards.max().item(), env_loss, policy_loss))
                 # save the model
                 torch.save(self.net.state_dict(), self.model_path + '/model.pt')
         return reward_hist, env_loss_hist, policy_loss_hist
@@ -149,64 +168,111 @@ class ppo_agent:
         for param_group in self.policy_optimizer.param_groups:
              param_group['lr'] = adjust_lr
 
-    def _update_network_by_env_net(self, obs, actions, reward):
-        lens_data = np.minimum(np.minimum(len(obs), len(actions)),len(reward))
-        inds = np.arange(lens_data)
-        nbatch_train = lens_data // self.args.batch_size
+    def _update_network_by_env_net(self, good_action, good_reward, bad_action, bad_reward, gobs, bobs, gpis, bpis):
+        lens_data_good = np.minimum(np.minimum(len(good_reward), len(good_action)), len(gobs))
+        lens_data_bad = np.minimum(np.minimum(len(bad_reward), len(bad_action)), len(bobs))
+        inds_good = np.arange(lens_data_good)
+        nbatch_train_good = lens_data_good // self.args.batch_size
+        inds_bad = np.arange(lens_data_bad)
+        nbatch_train_bad = lens_data_bad // self.args.batch_size
         BCE_loss = torch.nn.BCELoss()
         L1_loss = torch.nn.L1Loss()
-
         for _ in range(self.args.epoch):
-            np.random.shuffle(inds)
-            for start in range(0, lens_data, nbatch_train):
-                # get the mini-batchs
-                end = start + nbatch_train
-                binds = inds[start:end]
-                obs_temp = obs[binds]
-                actions_temp = actions[binds]
-                reward_temp = reward[binds]
-                obs_temp = torch.tensor(obs_temp, dtype=torch.float32)
-                actions_temp = torch.tensor(actions_temp, dtype=torch.float32)
-                reward_temp = torch.tensor(reward_temp, dtype=torch.float32)
+            if nbatch_train_good != 0:
+                np.random.shuffle((inds_good))
+                for start in range(0, lens_data_good, nbatch_train_good):
+                    end = start + nbatch_train_good
+                    binds = inds_good[start:end]
+                    good_action_temp = torch.tensor(good_action[binds], dtype=torch.float32)
+                    good_reward_temp = torch.tensor(good_reward[binds], dtype=torch.float32)
 
-                self.env_optimizer.zero_grad()
-                obs_env = torch.reshape(obs_temp, [-1, 110592])
-                actions_env = torch.reshape(actions_temp, [-1, 1])
-                pred_reward = self.env_net(obs_env, actions_env)
-                env_loss = BCE_loss(pred_reward.reshape(-1,1), reward_temp.reshape(-1, 1))
-                torch.nn.utils.clip_grad_norm_(self.env_net.parameters(), self.args.max_grad_norm)
-                env_loss.backward()
-                self.env_optimizer.step()
-                # if np.mean(reward) > 0:
+                    gobs_temp = torch.tensor(gobs[binds], dtype=torch.float32)
+                    # gpis_temp = torch.tensor(gpis[binds], dtype=torch.float32)
+                    # print(gpis_temp.shape, good_action_temp.shape)
+                    self.env_optimizer.zero_grad()
+                    gobs_env = torch.reshape(gobs_temp, [-1, 110592])
 
-                obs_shape = (-1, ) + self.obs_shape
-                obs_temp2 = np.reshape(obs_temp.detach().cpu().numpy(), obs_shape)
-                obs_temp2 = np.transpose(obs_temp2, (0, 3, 1, 2))
-                obs_temp2 = torch.tensor(obs_temp2, dtype=torch.float32)
+                    good_actions_env = torch.reshape(good_action_temp, [-1, 1])
+                    gpred_reward = self.env_net(gobs_env, good_actions_env)
+                    env_loss = BCE_loss(gpred_reward.reshape(-1, 1), good_reward_temp.reshape(-1, 1))
+                    torch.nn.utils.clip_grad_norm_(self.env_net.parameters(), self.args.max_grad_norm)
+                    env_loss.backward()
+                    self.env_optimizer.step()
 
-                _, pis = self.net(obs_temp2)
-                try:
-                    pred_action = select_actions(pis)
-                except:
-                    pis = torch.tensor(np.ones_like(pis.detach().cpu().numpy())/2)
-                    pred_action = select_actions(pis)
-                pred_action = np.reshape(pred_action, [-1, 1])
-                pred_action = torch.tensor(pred_action, dtype=torch.float32)
-                obs_env = torch.reshape(obs_temp, [-1, 110592])
-                actions_env = torch.reshape(pred_action, [-1, 1])
-                corresponding_reward = self.env_net(obs_env, actions_env)
-                policy_loss = BCE_loss(corresponding_reward, torch.ones_like(corresponding_reward)/2)
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
-                if not os.path.exists('policy_model'):
-                    os.makedirs('policy_model')
-                torch.save(self.net.state_dict(), self.args.policy_model_dir + '/policy_net.pth')
+                    obs_shape = (-1, ) + self.obs_shape
+                    gobs_temp2 = np.reshape(gobs_temp.detach().cpu().numpy(), obs_shape)
+                    gobs_temp2 = np.transpose(gobs_temp2, (0, 3, 1, 2))
+                    gobs_temp2 = torch.tensor(gobs_temp2, dtype=torch.float32)
+
+                    _, pis = self.net(gobs_temp2)
+                    try:
+                        pred_action = select_actions(pis)
+                    except:
+                        pis = torch.tensor(np.ones_like(pis.detach().cpu().numpy())/2)
+                        pred_action = select_actions(pis)
+                    pred_action = np.reshape(pred_action, [-1, 1])
+                    pred_action = torch.tensor(pred_action, dtype=torch.float32)
+                    obs_env = torch.reshape(gobs_temp, [-1, 110592])
+                    actions_env = torch.reshape(pred_action, [-1, 1])
+                    corresponding_reward = self.env_net(obs_env, actions_env)
+                    policy_loss = BCE_loss(corresponding_reward, torch.ones_like(corresponding_reward))
+                    torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
+                    self.policy_optimizer.zero_grad()
+                    policy_loss.backward()
+                    self.policy_optimizer.step()
+                    if not os.path.exists('policy_model'):
+                        os.makedirs('policy_model')
+                    torch.save(self.net.state_dict(), self.args.policy_model_dir + '/policy_net.pth')
+
+            if nbatch_train_bad != 0:
+                np.random.shuffle((inds_bad))
+                for start in range(0, lens_data_bad, nbatch_train_bad):
+                    end = start + nbatch_train_bad
+                    binds = inds_bad[start:end]
+                    bad_action_temp = torch.tensor(bad_action[binds], dtype=torch.float32)
+                    bad_reward_temp = torch.tensor(bad_reward[binds], dtype=torch.float32)
+
+                    bobs_temp = torch.tensor(bobs[binds], dtype=torch.float32)
+                    # bpis_temp = torch.tensor(bpis[binds], dtype=torch.float32)
+                    self.env_optimizer.zero_grad()
+                    bobs_env = torch.reshape(bobs_temp, [-1, 110592])
+
+                    bad_actions_env = torch.reshape(bad_action_temp, [-1, 1])
+                    bpred_reward = self.env_net(bobs_env, bad_actions_env)
+                    bad_reward_temp = torch.reshape(bad_reward_temp, [-1, 1])
+                    env_loss = BCE_loss(bpred_reward.reshape(-1, 1), bad_reward_temp.reshape(-1, 1))
+                    torch.nn.utils.clip_grad_norm_(self.env_net.parameters(), self.args.max_grad_norm)
+                    env_loss.backward()
+                    self.env_optimizer.step()
+
+                    obs_shape = (-1,) + self.obs_shape
+                    bobs_temp2 = np.reshape(bobs_temp.detach().cpu().numpy(), obs_shape)
+                    bobs_temp2 = np.transpose(bobs_temp2, (0, 3, 1, 2))
+                    bobs_temp2 = torch.tensor(bobs_temp2, dtype=torch.float32)
+
+                    _, pis = self.net(bobs_temp2)
+                    try:
+                        pred_action = select_actions(pis)
+                    except:
+                        pis = torch.tensor(np.ones_like(pis.detach().cpu().numpy()) / 2)
+                        pred_action = select_actions(pis)
+                    pred_action = np.reshape(pred_action, [-1, 1])
+                    pred_action = torch.tensor(pred_action, dtype=torch.float32)
+                    obs_env = torch.reshape(bobs_temp, [-1, 110592])
+                    actions_env = torch.reshape(pred_action, [-1, 1])
+                    corresponding_reward = self.env_net(obs_env, actions_env)
+                    policy_loss = BCE_loss(corresponding_reward, torch.ones_like(corresponding_reward))
+                    torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
+                    self.policy_optimizer.zero_grad()
+                    policy_loss.backward()
+                    self.policy_optimizer.step()
+                    if not os.path.exists('policy_model'):
+                        os.makedirs('policy_model')
+                    torch.save(self.net.state_dict(), self.args.policy_model_dir + '/policy_net.pth')
         return env_loss.item(), policy_loss.item()
 
 
-        # update the network
+    # update the network
     def _update_network(self, obs, actions, returns, advantages):
         inds = np.arange(obs.shape[0])
         nbatch_train = obs.shape[0] // self.args.batch_size

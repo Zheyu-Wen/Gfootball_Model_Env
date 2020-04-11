@@ -6,9 +6,9 @@ from datetime import datetime
 import os
 import copy
 
-class ppo_agent:
+class a2c_agent:
     def __init__(self, envs, args, net, env_net=None):
-        self.envs = envs 
+        self.envs = envs
         self.args = args
         # define the newtork...
         self.net = net
@@ -62,7 +62,7 @@ class ppo_agent:
                 # select actions
                 actions = select_actions(pis)
                 # get the input actions
-                input_actions = actions 
+                input_actions = actions
                 # start to store information
                 mb_obs.append(np.copy(self.obs))
                 mb_actions.append(actions)
@@ -98,8 +98,6 @@ class ppo_agent:
                 last_values = last_values.detach().cpu().numpy().squeeze()
             # start to compute advantages...
             mb_returns = np.zeros_like(mb_rewards)
-            mb_advs = np.zeros_like(mb_rewards)
-            lastgaelam = 0
             for t in reversed(range(self.args.nsteps)):
                 if t == self.args.nsteps - 1:
                     nextnonterminal = 1.0 - self.dones
@@ -107,9 +105,8 @@ class ppo_agent:
                 else:
                     nextnonterminal = 1.0 - mb_dones[t + 1]
                     nextvalues = mb_values[t + 1]
-                delta = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal - mb_values[t]
-                mb_advs[t] = lastgaelam = delta + self.args.gamma * self.args.tau * nextnonterminal * lastgaelam
-            mb_returns = mb_advs + mb_values
+                mb_returns[t] = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal
+            mb_advs = mb_returns - mb_values
             # after compute the returns, let's process the rollouts
             mb_obs = mb_obs.swapaxes(0, 1).reshape(self.batch_ob_shape)
             mb_actions = mb_actions.swapaxes(0, 1).flatten()
@@ -118,11 +115,11 @@ class ppo_agent:
             # before update the network, the old network will try to load the weights
             self.old_net.load_state_dict(self.net.state_dict())
             # start to update the network
-            pl, vl, ent = self._update_network(mb_obs, mb_actions, mb_returns, mb_advs)
-            # env_loss, policy_loss = self._update_network_by_env_net(mb_obs, mb_actions, mb_rewards)
+            loss = self._update_network(mb_obs, mb_actions, mb_returns, mb_advs)
+            policy_loss_hist.append(loss)
             # display the training information
             reward_hist.append(final_rewards.mean().detach().cpu().numpy())
-            policy_loss_hist.append(pl)
+            # policy_loss_hist.append(policy_loss)
             # env_loss_hist.append(env_loss)
             if update % self.args.display_interval == 0:
                 self.logger.info('[{}] Update: {} / {}, Frames: {}, Rewards: {:.3f}, Min: {:.3f}, Max: {:.3f}'
@@ -149,63 +146,6 @@ class ppo_agent:
         for param_group in self.policy_optimizer.param_groups:
              param_group['lr'] = adjust_lr
 
-    def _update_network_by_env_net(self, obs, actions, reward):
-        lens_data = np.minimum(np.minimum(len(obs), len(actions)),len(reward))
-        inds = np.arange(lens_data)
-        nbatch_train = lens_data // self.args.batch_size
-        BCE_loss = torch.nn.BCELoss()
-        L1_loss = torch.nn.L1Loss()
-
-        for _ in range(self.args.epoch):
-            np.random.shuffle(inds)
-            for start in range(0, lens_data, nbatch_train):
-                # get the mini-batchs
-                end = start + nbatch_train
-                binds = inds[start:end]
-                obs_temp = obs[binds]
-                actions_temp = actions[binds]
-                reward_temp = reward[binds]
-                obs_temp = torch.tensor(obs_temp, dtype=torch.float32)
-                actions_temp = torch.tensor(actions_temp, dtype=torch.float32)
-                reward_temp = torch.tensor(reward_temp, dtype=torch.float32)
-
-                self.env_optimizer.zero_grad()
-                obs_env = torch.reshape(obs_temp, [-1, 110592])
-                actions_env = torch.reshape(actions_temp, [-1, 1])
-                pred_reward = self.env_net(obs_env, actions_env)
-                env_loss = BCE_loss(pred_reward.reshape(-1,1), reward_temp.reshape(-1, 1))
-                torch.nn.utils.clip_grad_norm_(self.env_net.parameters(), self.args.max_grad_norm)
-                env_loss.backward()
-                self.env_optimizer.step()
-                # if np.mean(reward) > 0:
-
-                obs_shape = (-1, ) + self.obs_shape
-                obs_temp2 = np.reshape(obs_temp.detach().cpu().numpy(), obs_shape)
-                obs_temp2 = np.transpose(obs_temp2, (0, 3, 1, 2))
-                obs_temp2 = torch.tensor(obs_temp2, dtype=torch.float32)
-
-                _, pis = self.net(obs_temp2)
-                try:
-                    pred_action = select_actions(pis)
-                except:
-                    pis = torch.tensor(np.ones_like(pis.detach().cpu().numpy())/2)
-                    pred_action = select_actions(pis)
-                pred_action = np.reshape(pred_action, [-1, 1])
-                pred_action = torch.tensor(pred_action, dtype=torch.float32)
-                obs_env = torch.reshape(obs_temp, [-1, 110592])
-                actions_env = torch.reshape(pred_action, [-1, 1])
-                corresponding_reward = self.env_net(obs_env, actions_env)
-                policy_loss = BCE_loss(corresponding_reward, torch.ones_like(corresponding_reward)/2)
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
-                if not os.path.exists('policy_model'):
-                    os.makedirs('policy_model')
-                torch.save(self.net.state_dict(), self.args.policy_model_dir + '/policy_net.pth')
-        return env_loss.item(), policy_loss.item()
-
-
         # update the network
     def _update_network(self, obs, actions, returns, advantages):
         inds = np.arange(obs.shape[0])
@@ -219,42 +159,28 @@ class ppo_agent:
                 mbinds = inds[start:end]
                 mb_obs = obs[mbinds]
                 mb_actions = actions[mbinds]
-                mb_returns = returns[mbinds]
                 mb_advs = advantages[mbinds]
                 # convert minibatches to tensor
                 mb_obs = self._get_tensors(mb_obs)
                 mb_actions = torch.tensor(mb_actions, dtype=torch.float32)
-                mb_returns = torch.tensor(mb_returns, dtype=torch.float32).unsqueeze(1)
                 mb_advs = torch.tensor(mb_advs, dtype=torch.float32).unsqueeze(1)
                 # normalize adv
                 mb_advs = (mb_advs - mb_advs.mean()) / (mb_advs.std() + 1e-8)
                 if self.args.cuda:
                     mb_actions = mb_actions.cuda()
-                    mb_returns = mb_returns.cuda()
                     mb_advs = mb_advs.cuda()
                 # start to get values
                 mb_values, pis = self.net(mb_obs)
-                # start to calculate the value loss...
-                value_loss = (mb_returns - mb_values).pow(2).mean()
-                # start to calculate the policy loss
-                with torch.no_grad():
-                    _, old_pis = self.old_net(mb_obs)
-                    # get the old log probs
-                    old_log_prob, _ = evaluate_actions(old_pis, mb_actions)
-                    old_log_prob = old_log_prob.detach()
                 # evaluate the current policy
                 log_prob, ent_loss = evaluate_actions(pis, mb_actions)
-                prob_ratio = torch.exp(log_prob - old_log_prob)
-                # surr1
-                surr1 = prob_ratio * mb_advs
-                surr2 = torch.clamp(prob_ratio, 1 - self.args.clip, 1 + self.args.clip) * mb_advs
-                policy_loss = -torch.min(surr1, surr2).mean()
-                # final total loss
-                total_loss = policy_loss + self.args.vloss_coef * value_loss - ent_loss * self.args.ent_coef
+                actor_loss = -(log_prob * mb_advs).mean()
+                critic_loss = mb_advs.pow(2).mean()
+
+                total_loss = 1 * actor_loss + 0.5 * critic_loss - 0.01 * ent_loss
                 # clear the grad buffer
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
                 # update
                 self.optimizer.step()
-        return policy_loss.item(), value_loss.item(), ent_loss.item()
+        return actor_loss.detach().cpu().numpy()
