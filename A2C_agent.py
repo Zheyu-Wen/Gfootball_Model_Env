@@ -97,7 +97,8 @@ class a2c_agent:
                 last_values, _ = self.net(obs_tensor)
                 last_values = last_values.detach().cpu().numpy().squeeze()
             # start to compute advantages...
-            mb_returns = np.zeros_like(mb_rewards)
+            mb_advs = np.zeros_like(mb_rewards)
+            lastgaelam = 0
             for t in reversed(range(self.args.nsteps)):
                 if t == self.args.nsteps - 1:
                     nextnonterminal = 1.0 - self.dones
@@ -105,8 +106,10 @@ class a2c_agent:
                 else:
                     nextnonterminal = 1.0 - mb_dones[t + 1]
                     nextvalues = mb_values[t + 1]
-                mb_returns[t] = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal
-            mb_advs = mb_returns - mb_values
+                # mb_returns[t] = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal
+                delta = mb_rewards[t] + self.args.gamma * nextvalues * nextnonterminal - mb_values[t]
+                mb_advs[t] = lastgaelam = delta + self.args.gamma * self.args.tau * nextnonterminal * lastgaelam
+            mb_returns = mb_advs + mb_values
             # after compute the returns, let's process the rollouts
             mb_obs = mb_obs.swapaxes(0, 1).reshape(self.batch_ob_shape)
             mb_actions = mb_actions.swapaxes(0, 1).flatten()
@@ -176,7 +179,7 @@ class a2c_agent:
                 actor_loss = -(log_prob * mb_advs).mean()
                 critic_loss = mb_advs.pow(2).mean()
 
-                total_loss = 1 * actor_loss + 0.5 * critic_loss - 0.01 * ent_loss
+                total_loss = 1 * actor_loss + 0.5 * critic_loss - 0.01 * ent_loss.mean()
                 # clear the grad buffer
                 self.optimizer.zero_grad()
                 total_loss.backward()

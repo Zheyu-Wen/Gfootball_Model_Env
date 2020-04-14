@@ -9,6 +9,7 @@ from ppo_agent_GAN import ppo_agent_gan
 from ppo_agent import ppo_agent
 from A2C_agent import a2c_agent
 from DDQN_agent import ddqn_agent
+from Compatition_learning_agent import Compation_agent
 import os
 
 # create the environment
@@ -19,8 +20,23 @@ def create_single_football_env(args):
             )
     return env
 
+
 if __name__ == '__main__':
-    mode = 'A2C'
+    mode = 'COMPATITION'
+    if mode == 'COMPATITION':
+        # get the arguments
+        args = get_args()
+        # create environments
+        envs = SubprocVecEnv([(lambda _i=i: create_single_football_env(args)) for i in range(args.num_workers)])
+        # create networks
+        network = cnn_net(envs.action_space.n)
+        # create the ppo agent
+        Compation_trainer = Compation_agent(envs, args, network)
+        reward_hist, player1_loss_hist, player2_loss_hist = Compation_trainer.learn()
+        np.save('reward_comp.npy', reward_hist)
+        np.save('comp_player1_loss_hist.npy', player1_loss_hist)
+        np.save('comp_player2_loss_hist.npy', player2_loss_hist)
+
     if mode == 'DDQN':
         # get the arguments
         args = get_args()

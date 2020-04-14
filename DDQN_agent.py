@@ -52,7 +52,7 @@ class ddqn_agent:
         policy_loss_hist = []
         env_loss_hist = []
         for update in range(num_updates):
-            mb_obs, mb_rewards, mb_actions, mb_dones, mb_values, Qvalues = [], [], [], [], [], []
+            mb_obs, mb_rewards, mb_actions, mb_nextobs, mb_dones, mb_values, Qvalues = [], [], [], [], [], [], []
             if self.args.lr_decay:
                 self._adjust_learning_rate(update, num_updates)
             for step in range(self.args.nsteps):
@@ -75,6 +75,7 @@ class ddqn_agent:
                 mb_dones.append(self.dones)
                 # start to excute the actions in the environment
                 obs, rewards, dones, _ = self.envs.step(input_actions)
+                mb_nextobs.append(obs)
                 # update dones
                 self.dones = dones
                 mb_rewards.append(rewards)
@@ -82,6 +83,7 @@ class ddqn_agent:
                 for n, done in enumerate(dones):
                     if done:
                         self.obs[n] = self.obs[n] * 0
+
                 self.obs = obs
                 # process the rewards part -- display the rewards on the screen
                 rewards = torch.tensor(np.expand_dims(np.stack(rewards), 1), dtype=torch.float32)
@@ -95,10 +97,14 @@ class ddqn_agent:
             Qvalues = np.asarray(Qvalues, dtype=np.float32)
             mb_obs = mb_obs.swapaxes(0, 1).reshape(self.batch_ob_shape)
             mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
+            mb_nextobs = np.asarray(mb_nextobs, dtype=np.float32)
+            mb_nextobs = mb_nextobs.swapaxes(0, 1).reshape(self.batch_ob_shape)
+
+            mb_actions = np.asarray(mb_actions, dtype=np.float32)
             # before update the network, the old network will try to load the weights
             self.old_net.load_state_dict(self.net.state_dict())
             # start to update the network
-            policy_loss = self._update_network(mb_obs, mb_rewards)
+            policy_loss = self._update_network(mb_obs, mb_actions, mb_rewards, mb_nextobs)
             policy_loss_hist.append(policy_loss)
             # display the training information
             reward_hist.append(final_rewards.mean().detach().cpu().numpy())
@@ -129,7 +135,9 @@ class ddqn_agent:
              param_group['lr'] = adjust_lr
 
         # update the network
-    def _update_network(self, obs, rewards):
+    def _update_network(self, obs, action, rewards, next_obs):
+        action = np.reshape(action, [-1, 1])
+        rewards = np.reshape(rewards, [-1, 1])
         lens_data = np.minimum(len(obs), len(rewards))
         inds = np.arange(lens_data)
         nbatch_train = lens_data // self.args.batch_size
@@ -141,18 +149,19 @@ class ddqn_agent:
                 end = start + nbatch_train
                 mbinds = inds[start:end]
                 mb_obs = obs[mbinds]
+                mb_actions = action[mbinds]
                 mb_rewards = rewards[mbinds]
+                mb_nextobs = next_obs[mbinds]
                 # convert minibatches to tensor
                 mb_obs = self._get_tensors(mb_obs)
-                _, q = self.net(mb_obs)
-                action = select_actions(q)
-                _, Q_sa_temp = self.old_net(mb_obs)
-                Q_sa_temp = Q_sa_temp.detach().cpu().numpy()
-                Q_sa = np.zeros_like(Q_sa_temp)
-                Q_sa[np.arange(nbatch_train), action] = Q_sa_temp[np.arange(nbatch_train), action]
-                target = mb_rewards + 0.9 * Q_sa
                 _, qpred = self.net(mb_obs)
-                loss = criterion(qpred, torch.tensor(target, dtype=torch.float32))
+                q_select = torch.gather(qpred, 1, torch.tensor(mb_actions).long())
+                mb_nextobs_tensor = self._get_tensors(mb_nextobs)
+                _, Q_sa_temp = self.net(mb_nextobs_tensor)
+                action_next = select_actions(Q_sa_temp)
+                Q_sa = torch.gather(self.old_net(mb_nextobs_tensor)[1], 1, torch.tensor(action_next.reshape(-1, 1), dtype=torch.float32).long())
+                target = torch.tensor(mb_rewards, dtype=torch.float32) + 0.9 * Q_sa.view(-1, 1)
+                loss = criterion(q_select.view(-1, 1), target)
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.args.max_grad_norm)
