@@ -1,4 +1,5 @@
 # Google Research Football 
+This is work done by me and my friends in machine learning course in Umich.
 We choose Google Research Football Environment (Gfootball) as our game environment. Gfootball environment is a novel open-source reinforcement learning environment proposed by Google in 2019. It provides researchers with a highly-optimized game engine that simulates the game of football as well as a set of progressively harder and diverse reinforcement learning scenarios where researchers can test their ideas and algorithms. In our project, we first implemented simple PPO algorithm on several simple football academy scenarios. Experiment results show that PPO algorithm can achieve fairly satisfying performance in some simple scenarios. But its performance degrades as the environment becomes complicated. So we applied multiagent selfplay algorithm to solve scenarios like 11 VS 11.    
 
 ## Environment setup
