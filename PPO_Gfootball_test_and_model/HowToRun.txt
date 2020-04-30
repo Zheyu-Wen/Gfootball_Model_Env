@@ -1,0 +1,15 @@
+CHECK RESULT
+(1)  See training result: All training logs are preserved in 'logs' folder.
+(2)  See test result: All test results are preserved in 'test result' folder, which contains videos of evaluation results in each scenarios.
+
+HOW TO RUN THIS CODE
+(1) Install Gfootball environment and other necessary packages ( e.g. stable baselines, gym, etc)
+See https://github.com/google-research/football (Note: this code is implemented on Ubuntu 18.04 LTS OS)
+
+(2) Evaluate existing model: 
+1. Select which model you want to evaluate. Set env-name parameter to a correct scenario name.
+2. Run test_PPO.py. If error occurred while running, execute MESA_GL_VERSION_OVERRIDE=3.2 MESA_GLSL_VERSION_OVERRIDE=150 python3 test_PPO.py command in the terminal.
+(3) Train a new model: 
+1. Select which scenario you want to train your PPO agent to solve. Set env-name parameter to a correct scenario name. Also, check other hyperparameters, they may affect the training result as well. 
+Some hints on how to config hyperparameters are provided in arguments.py. To benchmark paper's result, you can check the hyperparameter table in https://arxiv.org/abs/1907.11180
+2. Run train_PPO.py directly
